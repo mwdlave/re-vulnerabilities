@@ -1,45 +1,15 @@
-import cmapy
 from typing import List, Dict, Union, Tuple, Literal, Optional, Set
-from transformer_lens import HookedTransformer, HookedTransformerConfig
-import heapq
+from collections import defaultdict
+from pathlib import Path
 import json
-import numpy as np
+import heapq
+
 import torch
+from transformer_lens import HookedTransformer, HookedTransformerConfig
+import numpy as np
 import pygraphviz as pgv
-from loguru import logger
 
-EDGE_TYPE_COLORS = {
-    "q": "#FF00FF",  # Purple
-    "k": "#00FF00",  # Green
-    "v": "#0000FF",  # Blue
-    None: "#000000",  # Black
-}
-
-
-def generate_random_color(colorscheme: str) -> str:
-    """
-    https://stackoverflow.com/questions/28999287/generate-random-colors-rgb
-    """
-
-    def rgb2hex(rgb):
-        """
-        https://stackoverflow.com/questions/3380726/converting-an-rgb-color-tuple-to-a-hexidecimal-string
-        """
-        return "#{:02x}{:02x}{:02x}".format(rgb[0], rgb[1], rgb[2])
-
-    return rgb2hex(cmapy.color(colorscheme, np.random.randint(0, 256), rgb_order=True))
-
-
-def load_graph_from_json(file_path):
-    try:
-        # Assuming Graph class has a from_dict method
-        return Graph.from_json(file_path)
-    except FileNotFoundError:
-        logger.error(f"Error: File not found at {file_path}")
-        return None
-    except Exception as e:
-        logger.error(f"Error loading graph from JSON: {e}")
-        return None
+from .visualization import EDGE_TYPE_COLORS, generate_random_color
 
 
 class Node:
@@ -224,65 +194,30 @@ class Graph:
             return 0
         elif isinstance(node, LogitNode):
             return self.n_forward
+            # raise ValueError(f"No forward for logits node")
         elif isinstance(node, MLPNode):
             return 1 + node.layer * (self.cfg["n_heads"] + 1) + self.cfg["n_heads"]
         elif isinstance(node, AttentionNode):
-            # Forward indexing remains the same. We assume one forward slot
-            # per attention head, so we use n_heads.
             i = 1 + node.layer * (self.cfg["n_heads"] + 1)
             return slice(i, i + self.cfg["n_heads"]) if attn_slice else i + node.head
         else:
             raise ValueError(f"Invalid node: {node} of type {type(node)}")
 
     def backward_index(self, node: Node, qkv=None, attn_slice=True):
-        """
-        Modified so that Q uses n_heads=32, while K and V each use n_key_value_heads=8.
-        """
         if isinstance(node, InputNode):
-            raise ValueError("No backward for input node")
-
+            raise ValueError(f"No backward for input node")
         elif isinstance(node, LogitNode):
             return -1
-
         elif isinstance(node, MLPNode):
-            # --- CHANGE: MLP node is offset after Q, K, V in each layer ---
-            # We define a layer stride as: Q( n_heads ) + K( n_kv ) + V( n_kv ) + 1 (for MLP).
-            layer_stride = (
-                self.cfg["n_heads"]
-                + 2 * self.cfg["n_key_value_heads"]
-                + 1  # Q + K + V + MLP
-            )
-            i = node.layer * layer_stride
-            offset_for_mlp = self.cfg["n_heads"] + 2 * self.cfg["n_key_value_heads"]
-            return i + offset_for_mlp
-
+            return (node.layer) * (3 * self.cfg["n_heads"] + 1) + 3 * self.cfg[
+                "n_heads"
+            ]
         elif isinstance(node, AttentionNode):
-            assert qkv in "qkv", f"Must give qkv for AttentionNode, got {qkv}"
-
-            # --- CHANGE: separate Q from K/V ---
-            # Q uses n_heads (e.g. 32), K/V each use n_key_value_heads (e.g. 8).
-            n_h = self.cfg["n_heads"]
-            n_kv = self.cfg["n_key_value_heads"]
-
-            # Each layer has Q( n_h ) + K( n_kv ) + V( n_kv ) + 1( MLP ) = total
-            layer_stride = n_h + 2 * n_kv + 1
-
-            # Starting index for this layer
-            i = node.layer * layer_stride
-
-            if qkv == "q":
-                offset = 0
-                size = n_h
-            elif qkv == "k":
-                offset = n_h
-                size = n_kv
-            else:  # qkv == 'v'
-                offset = n_h + n_kv
-                size = n_kv
-
-            i += offset
-            return slice(i, i + size) if attn_slice else i + node.head
-
+            assert qkv in "qkv", f"Must give qkv for AttentionNode, but got {qkv}"
+            i = node.layer * (3 * self.cfg["n_heads"] + 1) + (
+                "qkv".index(qkv) * self.cfg["n_heads"]
+            )
+            return slice(i, i + self.cfg["n_heads"]) if attn_slice else i + node.head
         else:
             raise ValueError(f"Invalid node: {node} of type {type(node)}")
 
@@ -333,10 +268,6 @@ class Graph:
             edge.in_graph = False
 
     def apply_greedy(self, n_edges, reset=True, absolute: bool = True):
-        """
-        Greedy approach to pick edges with the largest absolute score until we have n_edges edges activated.
-        Uses a single max-heap (negative scores) and a unique ID to avoid Edge < Edge comparison.
-        """
         if reset:
             for node in self.nodes.values():
                 node.in_graph = False
@@ -347,33 +278,33 @@ class Graph:
         def abs_id(s: float):
             return abs(s) if absolute else s
 
-        # Build initial list of candidate edges (child in_graph == True).
-        candidate_edges = [e for e in self.edges.values() if e.child.in_graph]
+        candidate_edges = sorted(
+            [edge for edge in self.edges.values() if edge.child.in_graph],
+            key=lambda edge: abs_id(edge.score),
+            reverse=True,
+        )
 
-        # Push items as (-score, unique_id, Edge) so we never compare Edge objects directly.
-        edges_heap = []
-        for e in candidate_edges:
-            heapq.heappush(edges_heap, (-abs_id(e.score), id(e), e))
-
-        while n_edges > 0 and edges_heap:
-            top_neg_score, _, top_edge = heapq.heappop(edges_heap)
-            if top_edge.in_graph:
-                # Already activated (could be a duplicate in heap)
-                continue
+        edges = heapq.merge(
+            candidate_edges, key=lambda edge: abs_id(edge.score), reverse=True
+        )
+        while n_edges > 0:
+            n_edges -= 1
+            top_edge = next(edges)
             top_edge.in_graph = True
-
             parent = top_edge.parent
             if not parent.in_graph:
                 parent.in_graph = True
-                # Add all of parent's *parent_edges* to the heap
-                for parent_edge in parent.parent_edges:
-                    if not parent_edge.in_graph:
-                        heapq.heappush(
-                            edges_heap,
-                            (-abs_id(parent_edge.score), id(parent_edge), parent_edge),
-                        )
-
-            n_edges -= 1
+                parent_parent_edges = sorted(
+                    [parent_edge for parent_edge in parent.parent_edges],
+                    key=lambda edge: abs_id(edge.score),
+                    reverse=True,
+                )
+                edges = heapq.merge(
+                    edges,
+                    parent_parent_edges,
+                    key=lambda edge: abs_id(edge.score),
+                    reverse=True,
+                )
 
     def prune_dead_nodes(self, prune_childless=True, prune_parentless=True):
         self.nodes["logits"].in_graph = any(
@@ -420,7 +351,6 @@ class Graph:
             graph.cfg = {
                 "n_layers": cfg.n_layers,
                 "n_heads": cfg.n_heads,
-                "n_key_value_heads": cfg.n_key_value_heads,  # <-- store n_key_value_heads
                 "parallel_attn_mlp": cfg.parallel_attn_mlp,
             }
         elif isinstance(model_or_config, HookedTransformerConfig):
@@ -428,7 +358,6 @@ class Graph:
             graph.cfg = {
                 "n_layers": cfg.n_layers,
                 "n_heads": cfg.n_heads,
-                "n_key_value_heads": cfg.n_key_value_heads,  # <-- store n_key_value_heads
                 "parallel_attn_mlp": cfg.parallel_attn_mlp,
             }
         else:
@@ -438,14 +367,10 @@ class Graph:
         graph.nodes[input_node.name] = input_node
         residual_stream = [input_node]
 
-        n_heads = graph.cfg["n_heads"]  # e.g. 32
-        n_kv = graph.cfg["n_key_value_heads"]  # e.g. 8
-
         for layer in range(graph.cfg["n_layers"]):
-
-            # We'll still create 32 attention nodes (one for each "head" 0..31).
-            # But we won't connect them to "k" or "v" edges if head > 7.
-            attn_nodes = [AttentionNode(layer, head) for head in range(n_heads)]
+            attn_nodes = [
+                AttentionNode(layer, head) for head in range(graph.cfg["n_heads"])
+            ]
             mlp_node = MLPNode(layer)
 
             for attn_node in attn_nodes:
@@ -455,14 +380,7 @@ class Graph:
             if graph.cfg["parallel_attn_mlp"]:
                 for node in residual_stream:
                     for attn_node in attn_nodes:
-                        # For Q, connect all heads [0..31].
-                        # For K, V, connect only if head < n_kv (i.e. 8).
-                        head_idx = attn_node.head
-                        # Loop over 'qkv'
                         for letter in "qkv":
-                            # Skip hooking if letter in {k, v} but head_idx >= n_kv
-                            if letter in ["k", "v"] and head_idx >= n_kv:
-                                continue
                             graph.add_edge(node, attn_node, qkv=letter)
                     graph.add_edge(node, mlp_node)
 
@@ -472,11 +390,7 @@ class Graph:
             else:
                 for node in residual_stream:
                     for attn_node in attn_nodes:
-                        head_idx = attn_node.head
                         for letter in "qkv":
-                            # Skip hooking if letter in {k, v} but head_idx >= n_kv
-                            if letter in ["k", "v"] and head_idx >= n_kv:
-                                continue
                             graph.add_edge(node, attn_node, qkv=letter)
                 residual_stream += attn_nodes
 
@@ -490,12 +404,8 @@ class Graph:
 
         graph.nodes[logit_node.name] = logit_node
 
-        # Finally set forward/backward size. The logic is now:
-        # forward: 1 + n_layers * (n_heads + 1)
-        # backward per layer: Q(32) + K(8) + V(8) + MLP(1) = 32 + 8 + 8 + 1 = 49, plus final logits = +1
-        layer_stride = n_heads + 2 * n_kv + 1
-        graph.n_forward = 1 + graph.cfg["n_layers"] * (n_heads + 1)
-        graph.n_backward = graph.cfg["n_layers"] * layer_stride + 1
+        graph.n_forward = 1 + graph.cfg["n_layers"] * (graph.cfg["n_heads"] + 1)
+        graph.n_backward = graph.cfg["n_layers"] * (3 * graph.cfg["n_heads"] + 1) + 1
 
         return graph
 
