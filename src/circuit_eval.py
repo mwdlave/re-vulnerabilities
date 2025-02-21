@@ -97,37 +97,18 @@ def evaluate_graph(
         tokenized = model.tokenizer(
             clean, padding="longest", return_tensors="pt", add_special_tokens=True
         )
-        input_lengths = 1 + tokenized.attention_mask.sum(1)
+        input_lengths = tokenized.attention_mask.sum(1)
         with torch.inference_mode():
             with model.hooks(corrupted_fwd_hooks):
-                additional = (
-                    torch.tensor([25] * len(corrupted)).unsqueeze(1).to(config.device)
-                )
-                corrupted_logits = model(
-                    torch.cat((model.to_tokens(corrupted), additional), dim=1)
-                )
-                # corrupted_logits = model(corrupted)
+                corrupted_logits = model(corrupted)
 
             with model.hooks(mixed_fwd_hooks + input_construction_hooks):
                 if empty_circuit:
                     # if the circuit is totally empty, so is nodes_in_graph
                     # so we just corrupt everything manually like this
-                    additional = (
-                        torch.tensor([25] * len(corrupted))
-                        .unsqueeze(1)
-                        .to(config.device)
-                    )
-                    logits = model(
-                        torch.cat((model.to_tokens(corrupted), additional), dim=1)
-                    )
+                    logits = model(corrupted)
                 else:
-                    additional = (
-                        torch.tensor([25] * len(clean)).unsqueeze(1).to(config.device)
-                    )
-                    logits = model(
-                        torch.cat((model.to_tokens(clean), additional), dim=1)
-                    )
-                    logger.debug("DEBUG model output shape:", logits.shape)
+                    logits = model(clean)
 
         for i, metric in enumerate(metrics):
             r = metric(logits, corrupted_logits, input_lengths, label).cpu()
@@ -150,6 +131,3 @@ def load_graph_from_json(file_path):
     except Exception as e:
         print(f"Error loading graph from JSON: {e}")
         return None
-
-
-

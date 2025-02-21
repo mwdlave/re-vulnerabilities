@@ -24,26 +24,19 @@ def evaluate_baseline(
         metrics_list = False
 
     results = [[] for _ in metrics]
-
     for clean, corrupted, label in tqdm(dataloader):
         logger.debug(f"Evaluting baseline with run corrupted={run_corrupted}")
         logger.debug(f"clean: {clean}")
         logger.debug(f"corrupted: {corrupted}")
         logger.debug(f"label: {label}")
         tokenized = model.tokenizer(
-            clean, padding="longest", return_tensors="pt", add_special_tokens=False
+            clean, padding="longest", return_tensors="pt", add_special_tokens=True
         )
-        input_lengths = 1 + tokenized.attention_mask.sum(1)
+        input_lengths = tokenized.attention_mask.sum(1)
         with torch.inference_mode():
-            additional = (
-                torch.tensor([25] * len(corrupted)).unsqueeze(1).to(config.device)
-            )
-            corrupted_logits = model(
-                torch.cat((model.to_tokens(corrupted), additional), dim=1)
-            )
+            corrupted_logits = model(corrupted)
             logger.debug(f"corrupted_logits: {corrupted_logits}")
-            additional = torch.tensor([25] * len(clean)).unsqueeze(1).to(config.device)
-            logits = model(torch.cat((model.to_tokens(clean), additional), dim=1))
+            logits = model(clean)
             logger.debug(f"logits: {logits}")
         for i, metric in enumerate(metrics):
             if run_corrupted:

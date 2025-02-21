@@ -157,9 +157,6 @@ class EAPDataset(Dataset):
                 "loaded dataset from",
                 f"{config.data_dir}/circuit_identification_data/{config.task}/corrupt_{config.task}_eap_{config.data_split}.csv",
             )
-            # testing with removing last character
-            self.df["clean"] = self.df["clean"].str[:-1]
-            self.df["corrupted"] = self.df["corrupted"].str[:-1]
             if config.tiny_sample:
                 self.df = self.df.sample(config.tiny_sample)
                 self.df.to_csv(
@@ -198,8 +195,9 @@ class EAPDataset(Dataset):
             label = [answer, corrupted_answer]
         elif "fact-retrieval" in self.task:
             label = [row["country_idx"], row["corrupted_country_idx"]]
-        elif "bias" in self.task:
-            logger.info(f"task: {self.task}")
+        elif "gender" in self.task:
+            label = [row["clean_answer_idx"], row["corrupted_answer_idx"]]
+        elif "adv" in self.task:
             label = [row["clean_answer_idx"], row["corrupted_answer_idx"]]
         elif self.task == "sva":
             label = row["plural"]

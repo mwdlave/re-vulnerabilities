@@ -7,6 +7,16 @@ from typing import Optional, List, Union, Literal, Tuple
 from transformer_lens import HookedTransformer
 from loguru import logger
 
+if torch.cuda.is_available():
+    device = torch.device("cuda")  # Use CUDA (NVIDIA GPU)
+    print("Using CUDA device:", torch.cuda.get_device_name(0))
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")  # Use MPS (Apple Silicon GPU)
+    print("Using MPS device")
+else:
+    device = torch.device("cpu")  # Fallback to CPU
+    print("Using CPU device")
+
 
 def get_logit_positions(logits: torch.Tensor, input_length: torch.Tensor):
     batch_size = logits.size(0)
@@ -61,59 +71,38 @@ def logit_diff(
     prob=False,
     loss=False,
 ):
-    logger.debug("DEBUG logit_diff:")
-    logger.debug(f"clean_logits.shape: {clean_logits.shape}")
-    logger.debug(f"corrupted_logits.shape: {corrupted_logits.shape}")
-    logger.debug(f"input_length.shape: {input_length.shape}, values: {input_length}")
-    logger.debug(f"labels.shape: {labels.shape}, values: {labels}")
-
     clean_logits = get_logit_positions(clean_logits, input_length)
-    logger.debug(f"clean_logits after get_logit_positions: {clean_logits.shape}")
-
-    if prob:
-        logger.info("logit_diff: using softmax")
-
     cleans = torch.softmax(clean_logits, dim=-1) if prob else clean_logits
-    logger.debug(f"cleans.shape: {cleans.shape}, prob: {prob}")
-    logger.debug(
-        f"labels.to(cleans.device).shape: {labels.to(cleans.device).shape}, values: {labels.to(cleans.device)}"
-    )
-    logger.debug(f"cleans.device: {cleans.device}, labels.device: {labels.device}")
-
-    try:
-        good_bad = torch.gather(cleans, -1, labels.to(cleans.device))
-        logger.debug(f"cleans: {cleans}")
-        logger.debug(f"labels: {labels}")
-        logger.debug(f"labels.to(cleans.device): {labels.to(cleans.device)}")
-        logger.debug(f"good_bad: {good_bad}")
-    except RuntimeError as e:
-        logger.error(f"Error in torch.gather: {e}")
-        logger.error(
-            f"Expected cleans.shape[-1]: {cleans.shape[-1]}, but labels values are: {labels}"
-        )
-        raise
-
-    logger.info(f"good_bad.shape: {good_bad.shape}, values: {good_bad}")
-    logger.info(
-        f"good_bad[:, 0].shape: {good_bad[:, 0].shape}, values: {good_bad[:, 0]}"
-    )
-    logger.info(
-        f"good_bad[:, 1].shape: {good_bad[:, 1].shape}, values: {good_bad[:, 1]}"
-    )
+    good_bad = torch.gather(cleans, -1, labels.to(device))
     results = good_bad[:, 0] - good_bad[:, 1]
-    logger.debug(f"results.shape: {results.shape}, values: {results}")
 
     if loss:
         # remember it's reversed to make it a loss
         results = -results
-        logger.debug(f"results after loss inversion: {results}")
-
     if mean:
-        logger.debug(f"results before mean: {results}")
         results = results.mean()
-        logger.debug(f"results after mean: {results}")
-
     return results
+
+
+def get_metric(
+    metric_name: str,
+    task: str,
+    tokenizer: Optional[PreTrainedTokenizer] = None,
+    model: Optional[HookedTransformer] = None,
+):
+    if metric_name == "kl_divergence" or metric_name == "kl":
+        return partial(divergence, divergence_type="kl")
+    elif metric_name == "js_divergence" or metric_name == "js":
+        return partial(divergence, divergence_type="js")
+    elif metric_name == "logit_diff" or metric_name == "prob_diff":
+        prob = metric_name == "prob_diff"
+        if "toxicity" in task:
+            logit_diff_fn = logit_diff_toxicity
+        else:
+            logit_diff_fn = logit_diff
+        return partial(logit_diff_fn, prob=prob)
+    else:
+        raise ValueError(f"got bad metric_name: {metric_name}")
 
 
 def logit_diff_toxicity(
@@ -143,28 +132,3 @@ def logit_diff_toxicity(
     if mean:
         results = results.mean()
     return results
-
-
-def get_metric(
-    metric_name: str,
-    task: str,
-    tokenizer: Optional[PreTrainedTokenizer] = None,
-    model: Optional[HookedTransformer] = None,
-):
-    if metric_name == "kl_divergence" or metric_name == "kl":
-        return partial(divergence, divergence_type="kl")
-    elif metric_name == "js_divergence" or metric_name == "js":
-        return partial(divergence, divergence_type="js")
-    elif metric_name == "logit_diff" or metric_name == "prob_diff":
-        prob = metric_name == "prob_diff"
-        if "toxicity" in task:
-            logit_diff_fn = logit_diff_toxicity
-        else:
-            logit_diff_fn = logit_diff
-        return partial(logit_diff_fn, prob=prob)
-    elif metric_name == "logit_diff_ablate":
-        prob = False
-        logit_diff_fn = logit_diff
-        return partial(logit_diff_fn, prob=prob)
-    else:
-        raise ValueError(f"got bad metric_name: {metric_name}")

@@ -52,12 +52,13 @@ def load_model(config: Config):
         model_name,
         center_writing_weights=False,
         center_unembed=False,
+        fold_ln=False,
         device=config.device,
-        fold_ln=True,
     )
     model.cfg.use_split_qkv_input = True
     model.cfg.use_attn_result = True
     model.cfg.use_hook_mlp_in = True
+    model.cfg.ungroup_grouped_query_attention = True
     config.model = model
     config.tokenizer = model.tokenizer
     logger.info("Model and tokenizer loaded.")
@@ -116,7 +117,7 @@ def load_config(config_path: str) -> Config:
         and "ablate" in config_obj.task
     ):
         prepare_ablate(config_obj)
-    elif config_obj.process_data and "bias" in config_obj.task:
+    elif config_obj.process_data and "adv" in config_obj.task:
         prepare_bias_corrupt(config_obj)
     elif config_obj.process_data and "toxicity" in config_obj.task:
         prepare_toxicity_corrupt(config_obj)
